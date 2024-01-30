@@ -45,8 +45,8 @@ open class LLM: ObservableObject {
         output = newOutput
     }
 
-    private var context: Context!
-    private var batch: llama_batch!
+    private var context: Context?
+    private var batch: llama_batch
     private let maxTokenCount: Int
     private let totalTokenCount: Int
     private let newlineToken: Token
@@ -91,6 +91,8 @@ open class LLM: ObservableObject {
         self.stopSequence = stopSequence?.utf8CString
         stopSequenceLength = (self.stopSequence?.count ?? 1) - 1
         batch = llama_batch_init(Int32(self.maxTokenCount), 0, 1)
+        print("SEEDED WITH \(seed)")
+        print("PARAMS: \(params)")
     }
 
     deinit {
@@ -179,6 +181,7 @@ open class LLM: ObservableObject {
 
     @InferenceActor
     private func predictNextToken() async -> Token {
+        guard let context else { fatalError("Context is nil") }
         guard shouldContinuePredicting else { return llama_token_eos(model) }
         let logits = llama_get_logits_ith(context.pointer, batch.n_tokens - 1)!
         var candidates: [llama_token_data] = (0 ..< totalTokenCount).map { token in
@@ -208,6 +211,7 @@ open class LLM: ObservableObject {
     private func prepare(from input: borrowing String, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
         guard !input.isEmpty else { return false }
         context = .init(model, params)
+        guard let context else { fatalError("Context is nil") }
         var tokens = encode(input)
         var initialCount = tokens.count
         currentCount = Int32(initialCount)
@@ -250,6 +254,7 @@ open class LLM: ObservableObject {
         }
     }
 
+    /// - Returns: `true` if the token is to end a generation, `false` otherwise.
     private func process(_ token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
         enum saved {
             static var endIndex = 0
@@ -287,7 +292,7 @@ open class LLM: ObservableObject {
 
     private func getResponse(from input: borrowing String) -> AsyncStream<String> {
         .init { output in Task {
-            defer { context = nil }
+            // defer { context = nil }
             guard prepare(from: input, to: output) else { return output.finish() }
             var response: [String] = []
             while currentCount < maxTokenCount {
@@ -301,7 +306,15 @@ open class LLM: ObservableObject {
     }
 
     private var input: String = ""
-    private var isAvailable = true
+    private(set) var isAvailable = true
+
+    @InferenceActor
+    public func waitUntilAvailable(timeout: DispatchTime) async throws {
+        while !isAvailable {
+            try await Task.sleep(nanoseconds: 1 * 1000 * 1000 * 1000) // 1 second
+            if timeout < .now() { throw LLMError.timeout }
+        }
+    }
 
     @InferenceActor
     public func getCompletion(from input: borrowing String) async -> String {
@@ -461,6 +474,10 @@ public enum Role {
     case bot
 }
 
+public enum LLMError: Error {
+    case timeout
+}
+
 public struct Template {
     public typealias Attachment = (prefix: String, suffix: String)
     public let system: Attachment
@@ -468,6 +485,7 @@ public struct Template {
     public let bot: Attachment
     public let systemPrompt: String?
     public let stopSequence: String?
+    public let softStopSequences: [String]?
     public let prefix: String
     public let shouldDropLast: Bool
 
@@ -477,6 +495,7 @@ public struct Template {
         user: Attachment? = nil,
         bot: Attachment? = nil,
         stopSequence: String? = nil,
+        softStopSequences: [String]? = nil,
         systemPrompt: String?,
         shouldDropLast: Bool = false
     ) {
@@ -484,6 +503,7 @@ public struct Template {
         self.user = user ?? ("", "")
         self.bot = bot ?? ("", "")
         self.stopSequence = stopSequence
+        self.softStopSequences = softStopSequences
         self.systemPrompt = systemPrompt
         self.prefix = prefix
         self.shouldDropLast = shouldDropLast
@@ -549,6 +569,7 @@ public struct Template {
         user: ("[INST] ", " [/INST]"),
         bot: ("", "</s> "),
         stopSequence: "</s>",
+        softStopSequences: ["[INST]", "[/INST]"],
         systemPrompt: nil
     )
 }
@@ -562,6 +583,7 @@ extension Template: CustomStringConvertible {
             user: ("\(user.prefix)", "\(user.suffix)"),
             bot: ("\(bot.prefix)", "\(bot.suffix)"),
             stopSequence: "\(stopSequence ?? "")",
+            softStopSequences: \(softStopSequences?.description ?? "nil"),
             systemPrompt: "\(systemPrompt ?? "")",
             shouldDropLast: \(shouldDropLast)
         )
