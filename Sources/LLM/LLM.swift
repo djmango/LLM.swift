@@ -215,32 +215,23 @@ open class LLM: ObservableObject {
 
         // Then remove the first chat until we have removed enough tokens
         while tokens.count > maxTokenCount, index < truncatedHistory.count {
-            let chatTokenCount = encode(truncatedHistory[index].content).count
+            // let chatTokenCount = encode(truncatedHistory[index].content).count
 
-            // If we have to remove all of the content, let's do that first
-            if chatTokenCount + tokens.count <= maxTokenCount {
+            // Get the amount of content we need to remove
+            let tokensToRemove = (tokens.count - maxTokenCount) + 50 // Add 50 to ensure we remove enough tokens
+            let contentToRemove = min(
+                tokensToRemove * 4,
+                truncatedHistory[index].content.count
+            ) // Multiply by 4 for average token
+
+            if contentToRemove == truncatedHistory[index].content.count {
                 truncatedHistory.remove(at: index)
-                index -= 1
                 print("Removed all of chat \(index)")
+                index -= 1
             } else {
-                // Now we know we can get away with removing only part of the content
-
-                // Get the amount of content we need to remove
-                let tokensToRemove = (tokens.count - maxTokenCount) + 50 // Add 50 to ensure we remove enough tokens
-                let contentToRemove = min(
-                    truncatedHistory[index].content.count * tokensToRemove * 4,
-                    truncatedHistory[index].content.count
-                ) // Multiply by 4 for average token
-
-                if contentToRemove == truncatedHistory[index].content.count {
-                    truncatedHistory.remove(at: index)
-                    index -= 1
-                    print("Removed all of chat \(index)")
-                } else {
-                    // Remove the content
-                    truncatedHistory[index].content.removeFirst(contentToRemove)
-                    print("Removed \(contentToRemove) characters from chat \(index)")
-                }
+                // Remove the content
+                truncatedHistory[index].content.removeFirst(contentToRemove)
+                print("Removed \(contentToRemove) characters from chat \(index)")
             }
 
             // Update tokens
