@@ -11,18 +11,11 @@ public typealias Chat = (role: Role, content: String)
 
 open class LLM: ObservableObject {
     public var model: Model
-    public var history: [Chat]
-    public var preProcess: (_ input: String, _ history: [Chat]) -> String = { input, _ in input }
-    public var postProcess: (_ output: String) -> Void = { print($0) }
+    public var preProcess: (_ history: [Chat]) -> String = { $0.map(\.content).joined() }
+    public var postProcess: (_ output: String) -> Void = { _ in }
     public var update: (_ outputDelta: String?) -> Void = { _ in }
-    public var template: Template? = nil {
+    public var template: Template! {
         didSet {
-            guard let template else {
-                preProcess = { input, _ in input }
-                stopSequence = nil
-                stopSequenceLength = 0
-                return
-            }
             preProcess = template.preProcess
             if let stopSequence = template.stopSequence?.utf8CString {
                 self.stopSequence = stopSequence
@@ -37,13 +30,7 @@ open class LLM: ObservableObject {
     public var topK: Int32
     public var topP: Float
     public var temp: Float
-    public var historyLimit: Int
     public var path: [CChar]
-
-    @Published public private(set) var output = ""
-    @MainActor public func setOutput(to newOutput: consuming String) {
-        output = newOutput
-    }
 
     private var context: Context?
     private var batch: llama_batch
@@ -58,12 +45,10 @@ open class LLM: ObservableObject {
     public init(
         from path: String,
         stopSequence: String? = nil,
-        history: [Chat] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
         temp: Float = 0.8,
-        historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048
     ) {
         self.path = path.cString(using: .utf8)!
@@ -83,9 +68,7 @@ open class LLM: ObservableObject {
         self.topK = topK
         self.topP = topP
         self.temp = temp
-        self.historyLimit = historyLimit
         self.model = model
-        self.history = history
         totalTokenCount = Int(llama_n_vocab(model))
         newlineToken = llama_token_nl(model)
         self.stopSequence = stopSequence?.utf8CString
@@ -102,23 +85,19 @@ open class LLM: ObservableObject {
     public convenience init(
         from url: URL,
         stopSequence: String? = nil,
-        history: [Chat] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
         temp: Float = 0.8,
-        historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048
     ) {
         self.init(
             from: url.path,
             stopSequence: stopSequence,
-            history: history,
             seed: seed,
             topK: topK,
             topP: topP,
             temp: temp,
-            historyLimit: historyLimit,
             maxTokenCount: maxTokenCount
         )
     }
@@ -127,24 +106,20 @@ open class LLM: ObservableObject {
         from huggingFaceModel: HuggingFaceModel,
         to url: URL = .documentsDirectory,
         as name: String? = nil,
-        history: [Chat] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
         temp: Float = 0.8,
-        historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048
     ) async throws {
         let url = try await huggingFaceModel.download(to: url, as: name)
         self.init(
             from: url,
             template: huggingFaceModel.template,
-            history: history,
             seed: seed,
             topK: topK,
             topP: topP,
             temp: temp,
-            historyLimit: historyLimit,
             maxTokenCount: maxTokenCount
         )
     }
@@ -152,23 +127,19 @@ open class LLM: ObservableObject {
     public convenience init(
         from url: URL,
         template: Template,
-        history: [Chat] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
         temp: Float = 0.8,
-        historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048
     ) {
         self.init(
             from: url.path,
             stopSequence: template.stopSequence,
-            history: history,
             seed: seed,
             topK: topK,
             topP: topP,
             temp: temp,
-            historyLimit: historyLimit,
             maxTokenCount: maxTokenCount
         )
         self.preProcess = template.preProcess
@@ -206,27 +177,16 @@ open class LLM: ObservableObject {
     }
 
     private var currentCount: Int32!
-    private var decoded = ""
 
-    private func prepare(from input: borrowing String, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
-        guard !input.isEmpty else { return false }
+    private func prepare(history: [Chat], to _: borrowing AsyncStream<String>.Continuation) -> Bool {
+        guard !history.isEmpty else { return false }
         context = .init(model, params)
         guard let context else { fatalError("Context is nil") }
-        var tokens = encode(input)
-        var initialCount = tokens.count
+
+        let tokens = truncateAndEncode(history: history)
+        let initialCount = tokens.count
         currentCount = Int32(initialCount)
-        if maxTokenCount <= currentCount {
-            if history.isEmpty {
-                isFull = true
-                output.yield("Input is too long.")
-                return false
-            } else {
-                history.removeFirst(min(2, history.count))
-                tokens = encode(preProcess(self.input, history))
-                initialCount = tokens.count
-                currentCount = Int32(initialCount)
-            }
-        }
+
         for (i, token) in tokens.enumerated() {
             batch.n_tokens = Int32(i)
             batch.add(token, batch.n_tokens, [0], i == initialCount - 1)
@@ -236,23 +196,79 @@ open class LLM: ObservableObject {
         return true
     }
 
-    @InferenceActor
-    private func finishResponse(from response: inout [String], to output: borrowing AsyncStream<String>.Continuation) async {
-        multibyteCharacter.removeAll()
-        var input = ""
-        if !history.isEmpty {
-            history.removeFirst(min(2, history.count))
-            input = preProcess(self.input, history)
-        } else {
-            response.scoup(response.count / 3)
-            input = preProcess(self.input, history)
-            input += response.joined()
+    /// Returns list of tokens, encoded from the history, truncated to the maximum token count.
+    private func truncateAndEncode(history: [Chat]) -> [Token] {
+        // Okay so first we have to calc how many tokens we need to remove
+        // From there we can get a % of how much of the history we need to remove
+        // Then we can remove that % of the history from the start, each Chat.content is a string
+        // Then we can encode the history again and return it
+        // If we need to remove more tokens after we preprocess the history again
+        // then we can just remove 5% repeatedly until we have the correct amount of tokens
+
+        var tokens = encode(preProcess(history))
+        guard tokens.count > maxTokenCount else { return tokens }
+
+        // Truncate content from the start of history and recount tokens
+        var truncatedHistory = history
+
+        var index = 0
+
+        // Then remove the first chat until we have removed enough tokens
+        while tokens.count > maxTokenCount, index < truncatedHistory.count {
+            let chatTokenCount = encode(truncatedHistory[index].content).count
+
+            // If we have to remove all of the content, let's do that first
+            if chatTokenCount + tokens.count <= maxTokenCount {
+                truncatedHistory.remove(at: index)
+                index -= 1
+                print("Removed all of chat \(index)")
+            } else {
+                // Now we know we can get away with removing only part of the content
+
+                // Get the amount of content we need to remove
+                let tokensToRemove = (tokens.count - maxTokenCount) + 50 // Add 50 to ensure we remove enough tokens
+                let contentToRemove = min(
+                    truncatedHistory[index].content.count * tokensToRemove * 4,
+                    truncatedHistory[index].content.count
+                ) // Multiply by 4 for average token
+
+                if contentToRemove == truncatedHistory[index].content.count {
+                    truncatedHistory.remove(at: index)
+                    index -= 1
+                    print("Removed all of chat \(index)")
+                } else {
+                    // Remove the content
+                    truncatedHistory[index].content.removeFirst(contentToRemove)
+                    print("Removed \(contentToRemove) characters from chat \(index)")
+                }
+            }
+
+            // Update tokens
+            tokens = encode(preProcess(truncatedHistory))
+            print("Tokens: \(tokens.count)")
+            index += 1
         }
-        let rest = getResponse(from: input)
-        for await restDelta in rest {
-            output.yield(restDelta)
-        }
+
+        return encode(preProcess(truncatedHistory))
     }
+
+    // @InferenceActor
+    // private func finishResponse(from response: inout [String], to output: borrowing AsyncStream<String>.Continuation) async {
+    //     multibyteCharacter.removeAll()
+    //     var input = ""
+    //     if !history.isEmpty { // TODO: revisit this
+    //         // history.removeFirst(min(2, history.count))
+    //         input = preProcess(history)
+    //     } else {
+    //         response.scoup(response.count / 3)
+    //         input = preProcess(history)
+    //         input += response.joined()
+    //     }
+    //     let rest = getResponse(from: input)
+    //     for await restDelta in rest {
+    //         output.yield(restDelta)
+    //     }
+    // }
 
     /// - Returns: `true` if the token is to end a generation, `false` otherwise.
     private func process(_ token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
@@ -290,22 +306,20 @@ open class LLM: ObservableObject {
         return true
     }
 
-    private func getResponse(from input: borrowing String) -> AsyncStream<String> {
+    private func getResponse(from history: borrowing[Chat]) -> AsyncStream<String> {
         .init { output in Task {
-            // defer { context = nil }
-            guard prepare(from: input, to: output) else { return output.finish() }
-            var response: [String] = []
+            guard prepare(history: history, to: output) else { return output.finish() }
+            // var response: [String] = []
             while currentCount < maxTokenCount {
                 let token = await predictNextToken()
                 if !process(token, to: output) { return output.finish() }
                 currentCount += 1
             }
-            await finishResponse(from: &response, to: output)
+            // await finishResponse(from: &response, to: output)
             return output.finish()
         } }
     }
 
-    private var input: String = ""
     private(set) var isAvailable = true
 
     @InferenceActor
@@ -317,10 +331,10 @@ open class LLM: ObservableObject {
     }
 
     @InferenceActor
-    public func getCompletion(from input: borrowing String) async -> String {
+    public func getCompletion(from input: String) async -> String {
         guard isAvailable else { fatalError("LLM is being used") }
         isAvailable = false
-        let response = getResponse(from: input)
+        let response = getResponse(from: [(.user, input)])
         var output = ""
         for await responseDelta in response {
             output += responseDelta
@@ -330,34 +344,46 @@ open class LLM: ObservableObject {
     }
 
     @InferenceActor
-    public func respond(to input: String, with makeOutputFrom: @escaping (AsyncStream<String>) async -> String) async {
+    public func respond(to history: [Chat], with makeOutputFrom: @escaping (AsyncStream<String>) async -> String) async {
         guard isAvailable else { return }
         isAvailable = false
-        self.input = input
-        let processedInput = preProcess(input, history)
-        let response = getResponse(from: processedInput)
+
+        let response = getResponse(from: history)
         let output = await makeOutputFrom(response)
-        history += [(.user, input), (.bot, output)]
-        let historyCount = history.count
-        if historyLimit < historyCount {
-            history.removeFirst(min(2, historyCount))
-        }
+
         postProcess(output)
         isAvailable = true
     }
 
-    open func respond(to input: String) async {
-        await respond(to: input) { [self] response in
-            await setOutput(to: "")
+    // open func respond(to history: [Chat]) async {
+    //     await respond(to: history) { [self] response in
+    //         var output = ""
+    //         for await responseDelta in response {
+    //             update(responseDelta)
+    //             output += responseDelta
+    //         }
+    //         update(nil)
+    //         let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
+    //         output = trimmedOutput.isEmpty ? "..." : trimmedOutput
+    //         return output
+    //     }
+    // }
+
+    open func respond(to history: [Chat]) async -> String {
+        var output = ""
+
+        // Using a custom asynchronous closure-based method
+        await respond(to: history) { [self] response in
             for await responseDelta in response {
                 update(responseDelta)
-                await setOutput(to: output + responseDelta)
+                output += responseDelta
             }
             update(nil)
-            let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            await setOutput(to: trimmedOutput.isEmpty ? "..." : trimmedOutput)
             return output
         }
+
+        let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedOutput.isEmpty ? "..." : trimmedOutput
     }
 
     private var multibyteCharacter: [CUnsignedChar] = []
@@ -452,15 +478,6 @@ extension llama_batch {
     }
 }
 
-extension [String] {
-    mutating func scoup(_ count: Int) {
-        guard count > 0 else { return }
-        let firstIndex = count
-        let lastIndex = count * 2
-        removeSubrange(firstIndex ..< lastIndex)
-    }
-}
-
 extension Token {
     enum Kind {
         case end
@@ -509,8 +526,8 @@ public struct Template {
         self.shouldDropLast = shouldDropLast
     }
 
-    public var preProcess: (_ input: String, _ history: [Chat]) -> String {
-        { [self] input, history in
+    public var preProcess: (_ history: [Chat]) -> String {
+        { [self] history in
             var processed = prefix
             if let systemPrompt {
                 processed += "\(system.prefix)\(systemPrompt)\(system.suffix)"
@@ -522,7 +539,6 @@ public struct Template {
                     processed += "\(bot.prefix)\(chat.content)\(bot.suffix)"
                 }
             }
-            processed += "\(user.prefix)\(input)\(user.suffix)"
             if shouldDropLast {
                 processed += bot.prefix.dropLast()
             } else {
