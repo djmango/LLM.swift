@@ -61,7 +61,7 @@ open class LLM: ObservableObject {
         let processorCount = UInt32(ProcessInfo().processorCount)
         self.maxTokenCount = Int(min(maxTokenCount, llama_n_ctx_train(model)))
         params.seed = seed
-        params.n_ctx = UInt32(maxTokenCount) + (maxTokenCount % 2 == 1 ? 1 : 2)
+        params.n_ctx = UInt32(maxTokenCount)
         params.n_batch = params.n_ctx
         params.n_threads = processorCount
         params.n_threads_batch = processorCount
@@ -198,13 +198,6 @@ open class LLM: ObservableObject {
 
     /// Returns list of tokens, encoded from the history, truncated to the maximum token count.
     private func truncateAndEncode(history: [Chat]) -> [Token] {
-        // Okay so first we have to calc how many tokens we need to remove
-        // From there we can get a % of how much of the history we need to remove
-        // Then we can remove that % of the history from the start, each Chat.content is a string
-        // Then we can encode the history again and return it
-        // If we need to remove more tokens after we preprocess the history again
-        // then we can just remove 5% repeatedly until we have the correct amount of tokens
-
         var tokens = encode(preProcess(history))
         guard tokens.count > maxTokenCount else { return tokens }
 
@@ -212,13 +205,14 @@ open class LLM: ObservableObject {
         var truncatedHistory = history
 
         var index = 0
+        let buffer = Double(maxTokenCount) * 0.10 // 10% buffer
 
         // Then remove the first chat until we have removed enough tokens
         while tokens.count > maxTokenCount, index < truncatedHistory.count {
             // let chatTokenCount = encode(truncatedHistory[index].content).count
 
             // Get the amount of content we need to remove
-            let tokensToRemove = (tokens.count - maxTokenCount) + 50 // Add 50 to ensure we remove enough tokens
+            let tokensToRemove = (tokens.count - maxTokenCount) + Int(buffer)
             let contentToRemove = min(
                 tokensToRemove * 4,
                 truncatedHistory[index].content.count
@@ -240,7 +234,13 @@ open class LLM: ObservableObject {
             index += 1
         }
 
-        return encode(preProcess(truncatedHistory))
+        if tokens.count > maxTokenCount {
+            print("WARNING: Truncation failed, tokens count is still greater than max token count")
+            print("Tokens: \(tokens.count)")
+            print("Max tokens: \(maxTokenCount)")
+        }
+
+        return tokens
     }
 
     // @InferenceActor
