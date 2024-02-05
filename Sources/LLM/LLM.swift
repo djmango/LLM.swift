@@ -41,6 +41,7 @@ open class LLM: ObservableObject {
     private var stopSequenceLength: Int
     private var params: llama_context_params
     private var isFull = false
+    private var updateProgress: (Double) -> Void = { _ in }
 
     public init(
         from path: String,
@@ -69,8 +70,8 @@ open class LLM: ObservableObject {
         self.topP = topP
         self.temp = temp
         self.model = model
-        totalTokenCount = Int(llama_n_vocab(model))
-        newlineToken = llama_token_nl(model)
+        self.totalTokenCount = Int(llama_n_vocab(model))
+        self.newlineToken = model.newLineToken
         self.stopSequence = stopSequence?.utf8CString
         stopSequenceLength = (self.stopSequence?.count ?? 1) - 1
         batch = llama_batch_init(Int32(self.maxTokenCount), 0, 1)
@@ -110,9 +111,12 @@ open class LLM: ObservableObject {
         topK: Int32 = 40,
         topP: Float = 0.95,
         temp: Float = 0.8,
-        maxTokenCount: Int32 = 2048
+        maxTokenCount: Int32 = 2048,
+        updateProgress: @escaping (Double) -> Void = { print(String(format: "downloaded(%.2f%%)", $0 * 100)) }
     ) async throws {
-        let url = try await huggingFaceModel.download(to: url, as: name)
+        let url = try await huggingFaceModel.download(to: url, as: name) { progress in
+            Task { await MainActor.run { updateProgress(progress) } }
+        }
         self.init(
             from: url,
             template: huggingFaceModel.template,
@@ -122,6 +126,7 @@ open class LLM: ObservableObject {
             temp: temp,
             maxTokenCount: maxTokenCount
         )
+        self.updateProgress = updateProgress
     }
 
     public convenience init(
@@ -143,6 +148,7 @@ open class LLM: ObservableObject {
             maxTokenCount: maxTokenCount
         )
         self.preProcess = template.preProcess
+        self.template = template
     }
 
     private var shouldContinuePredicting = false
@@ -153,9 +159,8 @@ open class LLM: ObservableObject {
     @InferenceActor
     private func predictNextToken() async -> Token {
         guard let context else { fatalError("Context is nil") }
-        guard shouldContinuePredicting else { return llama_token_eos(model) }
         let logits = llama_get_logits_ith(context.pointer, batch.n_tokens - 1)!
-        var candidates: [llama_token_data] = (0 ..< totalTokenCount).map { token in
+        var candidates = (0 ..< totalTokenCount).map { token in
             llama_token_data(id: Int32(token), logit: logits[token], p: 0.0)
         }
         var token: llama_token!
@@ -177,6 +182,11 @@ open class LLM: ObservableObject {
     }
 
     private var currentCount: Int32!
+    private var decoded = ""
+
+    open func recoverFromLengthy(_: borrowing String, to output: borrowing AsyncStream<String>.Continuation) {
+        output.yield("tl;dr")
+    }
 
     private func prepare(history: [Chat], to _: borrowing AsyncStream<String>.Continuation) -> Bool {
         guard !history.isEmpty else { return false }
@@ -186,7 +196,6 @@ open class LLM: ObservableObject {
         let tokens = truncateAndEncode(history: history)
         let initialCount = tokens.count
         currentCount = Int32(initialCount)
-
         for (i, token) in tokens.enumerated() {
             batch.n_tokens = Int32(i)
             batch.add(token, batch.n_tokens, [0], i == initialCount - 1)
@@ -265,25 +274,27 @@ open class LLM: ObservableObject {
     private func process(_ token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
         enum saved {
             static var endIndex = 0
+            static var stopSequenceEndIndex = 0
             static var letters: [CChar] = []
         }
-        guard token != llama_token_eos(model) else { return false }
+        guard token != model.endToken else { return false }
         var word = decode(token)
         guard let stopSequence else { output.yield(word); return true }
-        var found = saved.endIndex > 0
+
+        var found = saved.stopSequenceEndIndex > 0
         var letters: [CChar] = []
         for letter in word.utf8CString {
             guard letter != 0 else { break }
-            if letter == stopSequence[saved.endIndex] {
-                saved.endIndex += 1
+            if letter == stopSequence[saved.stopSequenceEndIndex] {
+                saved.stopSequenceEndIndex += 1
                 found = true
                 saved.letters.append(letter)
-                guard saved.endIndex == stopSequenceLength else { continue }
-                saved.endIndex = 0
+                guard saved.stopSequenceEndIndex == stopSequenceLength else { continue }
+                saved.stopSequenceEndIndex = 0
                 saved.letters.removeAll()
                 return false
             } else if found {
-                saved.endIndex = 0
+                saved.stopSequenceEndIndex = 0
                 if !saved.letters.isEmpty {
                     word = String(cString: saved.letters + [0]) + word
                     saved.letters.removeAll()
@@ -346,20 +357,6 @@ open class LLM: ObservableObject {
         isAvailable = true
     }
 
-    // open func respond(to history: [Chat]) async {
-    //     await respond(to: history) { [self] response in
-    //         var output = ""
-    //         for await responseDelta in response {
-    //             update(responseDelta)
-    //             output += responseDelta
-    //         }
-    //         update(nil)
-    //         let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
-    //         output = trimmedOutput.isEmpty ? "..." : trimmedOutput
-    //         return output
-    //     }
-    // }
-
     open func respond(to history: [Chat]) async -> String {
         var output = ""
 
@@ -382,14 +379,17 @@ open class LLM: ObservableObject {
         model.decode(token, with: &multibyteCharacter)
     }
 
-    @inlinable
+    // @inlinable
     public func encode(_ text: borrowing String) -> [Token] {
         model.encode(text)
     }
 }
 
-public extension Model {
-    func shouldAddBOS() -> Bool {
+extension Model {
+    public var endToken: Token { llama_token_eos(self) }
+    public var newLineToken: Token { llama_token_nl(self) }
+
+    public func shouldAddBOS() -> Bool {
         let addBOS = llama_add_bos_token(self)
         guard addBOS != -1 else {
             return llama_vocab_type(self) == LLAMA_VOCAB_TYPE_SPM
@@ -561,7 +561,7 @@ public struct Template {
 
     public static func llama(_ systemPrompt: String? = nil) -> Template {
         Template(
-            prefix: "<s>[INST] ",
+            prefix: "[INST] ",
             system: ("<<SYS>>\n", "\n<</SYS>>\n\n"),
             user: ("", " [/INST]"),
             bot: (" ", "</s><s>[INST] "),
@@ -572,7 +572,6 @@ public struct Template {
     }
 
     public static let mistral = Template(
-        prefix: "<s>",
         user: ("[INST] ", " [/INST]"),
         bot: ("", "</s> "),
         stopSequence: "</s>",
@@ -617,6 +616,7 @@ public enum Quantization: String {
 public enum HuggingFaceError: Error {
     case network(statusCode: Int)
     case noFilteredURL
+    case urlIsNilForSomeReason
 }
 
 public struct HuggingFaceModel {
@@ -630,7 +630,7 @@ public struct HuggingFaceModel {
         self.filterRegexPattern = filterRegexPattern
     }
 
-    public init(_ name: String, template: Template, with quantization: Quantization = .Q4_K_M) {
+    public init(_ name: String, _ quantization: Quantization = .Q4_K_M, template: Template) {
         self.name = name
         self.template = template
         self.filterRegexPattern = "(?i)\(quantization.rawValue)"
@@ -655,22 +655,21 @@ public struct HuggingFaceModel {
         return nil
     }
 
-    public func download(to directory: URL = .documentsDirectory, as name: String? = nil) async throws -> URL {
+    public func download(to directory: URL = .documentsDirectory, as name: String? = nil, _ updateProgress: @escaping (Double) -> Void) async throws -> URL {
         var destination: URL
         if let name {
             destination = directory.appending(path: name)
-            guard !destination.exists else { return destination }
+            guard !destination.exists else { updateProgress(1); return destination }
         }
         guard let downloadURL = try await getDownloadURL() else { throw HuggingFaceError.noFilteredURL }
         destination = directory.appending(path: downloadURL.lastPathComponent)
         guard !destination.exists else { return destination }
-        let data = try await downloadURL.getData()
-        try data.write(to: destination)
+        try await downloadURL.downloadData(to: destination, updateProgress)
         return destination
     }
 
-    public static func tinyLLaMA(_ systemPrompt: String, with quantization: Quantization = .Q4_K_M) -> HuggingFaceModel {
-        HuggingFaceModel("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", template: .chatML(systemPrompt), with: quantization)
+    public static func tinyLLaMA(_ quantization: Quantization = .Q4_K_M, _ systemPrompt: String) -> HuggingFaceModel {
+        HuggingFaceModel("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", quantization, template: .chatML(systemPrompt))
     }
 }
 
@@ -691,6 +690,25 @@ extension URL {
         let statusCode = (response as! HTTPURLResponse).statusCode
         guard statusCode / 100 == 2 else { throw HuggingFaceError.network(statusCode: statusCode) }
         return data
+    }
+
+    fileprivate func downloadData(to destination: URL, _ updateProgress: @escaping (Double) -> Void) async throws {
+        var observation: NSKeyValueObservation!
+        let url: URL = try await withCheckedThrowingContinuation { continuation in
+            let task = URLSession.shared.downloadTask(with: self) { url, response, error in
+                if let error { return continuation.resume(throwing: error) }
+                guard let url else { return continuation.resume(throwing: HuggingFaceError.urlIsNilForSomeReason) }
+                let statusCode = (response as! HTTPURLResponse).statusCode
+                guard statusCode / 100 == 2 else { return continuation.resume(throwing: HuggingFaceError.network(statusCode: statusCode)) }
+                continuation.resume(returning: url)
+            }
+            observation = task.progress.observe(\.fractionCompleted) { progress, _ in
+                updateProgress(progress.fractionCompleted)
+            }
+            task.resume()
+        }
+        _ = observation
+        try FileManager.default.moveItem(at: url, to: destination)
     }
 }
 

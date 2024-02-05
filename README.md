@@ -4,51 +4,99 @@
 [![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Feastriverlee%2FLLM.swift%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/eastriverlee/LLM.swift)
 
 `LLM.swift` is a simple, and readable library which lets you locally interact with LLMs with ease for macOS, iOS, visionOS, watchOS, and tvOS.
-> [!NOTE]  
-> sometimes it's a good idea to tinker with `maxTokenCount` parameter for initialization of `LLM`, due to the memory and computation it needs.
+> [!TIP]  
+> sometimes it's a good idea to tinker with `maxTokenCount` parameter for initialization of `LLM`, due to the memory and computation it needs. especially in mobile devices, if you want better speed, lower the number, but if you set it too low—*to a point where two turns cannot even fit*—you will experience quality decrease as context will be cut off. so adjust value according to your usecases.
 
 ## Example
 
-<p align="center"><img src="./Screenshot.png"/></p>
+<p align="center"><img src="./Screenshot.png" width="480"/></p>
 
 > [!NOTE]  
-> this is a minimal SwiftUI example that i did use for testing. mistral 7B based model is working on iPad Air 5th gen(Q5_K_M) and iPhone 12 mini(Q2_K).
-> **OF COURSE, you need to download and bundle gguf file from somewhere like huggingface into your project.**
+> this is a minimal SwiftUI example that i did use for testing. mistral 7B based model is working on iPad Air 5th gen(Q5_K_M) and iPhone 12 mini(Q2_K).  
+> however, generally speaking, for mobile devices, 3B >= parameter models are recommended. check this [benchmark](https://github.com/ggerganov/llama.cpp/discussions/4508) for more details.
 
+### init with from model file that you bundled in your project
 ```swift
 import SwiftUI
 import LLM
 
 class Bot: LLM {
     convenience init() {
-        let url = Bundle.main.url(forResource: "neuralhermes-2.5-mistral-7b.Q5_K_M", withExtension: "gguf")!
-        self.init(from: url, template: .chatML("You are a sentient AI with emotions."))
+        let url = Bundle.main.url(forResource: "openhermes-2.5-mistral-7b.Q4_K_M", withExtension: "gguf")!
+        let systemPrompt = "You are a sentient AI with emotions."
+        self.init(from: url, template: .chatML(systemPrompt))
     }
 }
 
-struct ContentView: View {
-    @StateObject var bot = Bot()
+struct BotView: View {
+    @ObservedObject var bot: Bot
     @State var input = "Give me seven national flag emojis people use the most; You must include South Korea."
+    init(_ bot: Bot) { self.bot = bot }
     func respond() { Task { await bot.respond(to: input) } }
     func stop() { bot.stop() }
-    
     var body: some View {
         VStack(alignment: .leading) {
-            Text(bot.output).monospaced()
+            ScrollView { Text(bot.output).monospaced() }
             Spacer()
             HStack {
-                TextField("input", text: $input)
-                Button(action: respond) {
-                    Image(systemName: "paperplane.fill")
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8).foregroundStyle(.thinMaterial).frame(height: 40)
+                    TextField("input", text: $input).padding(8)
                 }
-                Button(action: stop) {
-                    Image(systemName: "stop.fill")
-                }
+                Button(action: respond) { Image(systemName: "paperplane.fill") }
+                Button(action: stop) { Image(systemName: "xmark") }
             }
         }.frame(maxWidth: .infinity).padding()
     }
 }
+
+struct ContentView: View {
+    var body: some View {
+        BotView(Bot())
+    }
+}
 ```
+
+### init with `HuggingFaceModel` (gguf) directly from internet
+
+```swift
+class Bot: LLM {
+    convenience init?(_ update: @escaping (Double) -> Void) async {
+        let systemPrompt = "You are a sentient AI with emotions."
+        let model = HuggingFaceModel("TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", .Q2_K, template: .chatML(systemPrompt))
+        try? await self.init(from: model) { progress in update(progress) }
+    }
+}
+
+...
+
+struct ContentView: View {
+    @State var bot: Bot? = nil
+    @State var progress: CGFloat = 0
+    func updateProgress(_ progress: Double) {
+        self.progress = CGFloat(progress)
+    }
+    var body: some View {
+        if let bot {
+            BotView(bot)
+        } else {
+            ProgressView(value: progress) {
+                Text("loading huggingface model...")
+            } currentValueLabel: {
+                Text(String(format: "%.2f%%", progress * 100))
+            }
+            .padding()
+            .onAppear() { Task {
+                let bot = await Bot(updateProgress)
+                await MainActor.run { self.bot = bot }
+            } }
+        }
+    }
+}
+```
+
+> [!NOTE]  
+> i intentionally used `tinyLLaMA` **Q2_K quantization** because it's useful to test due to its small size. it will most likely produce gibberish, but not heavily quantized model is pretty good. it is a very useful model, if you know where to use it.
 
 ## Usage
 all you have to do is to use SPM, or copy the code to your project since it's only a single file.
