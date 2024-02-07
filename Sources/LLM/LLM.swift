@@ -184,13 +184,13 @@ open class LLM: ObservableObject {
     }
 
     private var currentCount: Int32!
-    private var decoded = ""
 
     open func recoverFromLengthy(_: borrowing String, to output: borrowing AsyncStream<String>.Continuation) {
         output.yield("tl;dr")
     }
 
-    private func prepare(history: [Chat], to _: borrowing AsyncStream<String>.Continuation) -> Bool {
+    /// - Returns: `true` if ready to predict the next token, `false` otherwise.
+    private func prepare(history: [Chat]) -> Bool {
         guard !history.isEmpty else { return false }
         context = .init(model, params)
         guard let context else { fatalError("Context is nil") }
@@ -215,11 +215,15 @@ open class LLM: ObservableObject {
         // Truncate content from the start of history and recount tokens
         var truncatedHistory = history
 
-        var index = 0
-        var buffer = Double(maxTokenCount) * 0.10 // 10% buffer
+        /// Buffer to add (remove, really) to the max token count to enforce more truncation
+        var buffer = Double(maxTokenCount) * 0.10
 
-        // Then remove the first chat until we have removed enough tokens
-        while tokens.count > maxTokenCount, index < truncatedHistory.count {
+        /// Number of times we've tried to truncate the history
+        var tries = 0
+
+        // While the tokens count is greater than the max token count, and we haven't tried to truncate the history more than 5 times
+        var index = 0
+        while tokens.count > maxTokenCount, index < truncatedHistory.count, tries <= 5 {
             // Get the amount of content we need to remove
             let tokensToRemove = (tokens.count - maxTokenCount) + Int(buffer)
             let contentToRemove = min(
@@ -242,8 +246,9 @@ open class LLM: ObservableObject {
             logger.debug("Tokens: \(tokens.count)")
             index += 1
 
-            // If we've reached the end of the history, increase buffer and start again. This has a potential to loop forever, but not really because the buffer is increased each time.
+            // If we've reached the end of the history, increase buffer and start again.
             if index >= truncatedHistory.count {
+                tries += 1
                 index = 0
                 buffer += Double(maxTokenCount) * 0.10
             }
@@ -312,11 +317,28 @@ open class LLM: ObservableObject {
 
     private func getResponse(from history: borrowing[Chat]) -> AsyncStream<String> {
         .init { output in Task {
-            guard prepare(history: history, to: output) else { return output.finish() }
+            guard prepare(history: history) else { return output.finish() }
+
+            var outputString = ""
+
             while currentCount < maxTokenCount {
                 let token = await predictNextToken()
                 if !process(token, to: output) { return output.finish() }
                 currentCount += 1
+
+                outputString += decode(token)
+
+                // Now we check if we have to slide the history window
+                if currentCount >= maxTokenCount {
+                    let start = DispatchTime.now()
+                    // Add the current output to the history
+                    let chat = (role: Role.bot, content: outputString)
+                    let newHistory = history + [chat]
+                    logger.debug("New history: \(newHistory)")
+                    guard prepare(history: newHistory) else { return output.finish() }
+                    logger.debug("Truncated history and continued in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
+                    logger.debug("New current count: \(self.currentCount)")
+                }
             }
             return output.finish()
         } }
