@@ -1,5 +1,6 @@
 import Foundation
 import llama
+import OSLog
 
 public typealias Token = llama_token
 public typealias Model = OpaquePointer
@@ -10,6 +11,8 @@ public typealias Chat = (role: Role, content: String)
 }
 
 open class LLM: ObservableObject {
+    private let logger = Logger(subsystem: "swift.LLM", category: "LLM")
+
     public var model: Model
     public var preProcess: (_ history: [Chat]) -> String = { $0.map(\.content).joined() }
     public var postProcess: (_ output: String) -> Void = { _ in }
@@ -75,8 +78,7 @@ open class LLM: ObservableObject {
         self.stopSequence = stopSequence?.utf8CString
         stopSequenceLength = (self.stopSequence?.count ?? 1) - 1
         batch = llama_batch_init(Int32(self.maxTokenCount), 0, 1)
-        print("SEEDED WITH \(seed)")
-        print("PARAMS: \(params)")
+        logger.debug("PARAMS: \(self.params)")
     }
 
     deinit {
@@ -214,12 +216,10 @@ open class LLM: ObservableObject {
         var truncatedHistory = history
 
         var index = 0
-        let buffer = Double(maxTokenCount) * 0.10 // 10% buffer
+        var buffer = Double(maxTokenCount) * 0.10 // 10% buffer
 
         // Then remove the first chat until we have removed enough tokens
         while tokens.count > maxTokenCount, index < truncatedHistory.count {
-            // let chatTokenCount = encode(truncatedHistory[index].content).count
-
             // Get the amount of content we need to remove
             let tokensToRemove = (tokens.count - maxTokenCount) + Int(buffer)
             let contentToRemove = min(
@@ -229,95 +229,95 @@ open class LLM: ObservableObject {
 
             if contentToRemove == truncatedHistory[index].content.count {
                 truncatedHistory.remove(at: index)
-                print("Removed all of chat \(index)")
+                logger.debug("Removed all of chat \(index)")
                 index -= 1
             } else {
                 // Remove the content
                 truncatedHistory[index].content.removeFirst(contentToRemove)
-                print("Removed \(contentToRemove) characters from chat \(index)")
+                logger.debug("Removed \(contentToRemove) characters from chat \(index)")
             }
 
             // Update tokens
             tokens = encode(preProcess(truncatedHistory))
-            print("Tokens: \(tokens.count)")
+            logger.debug("Tokens: \(tokens.count)")
             index += 1
+
+            // If we've reached the end of the history, increase buffer and start again. This has a potential to loop forever, but not really because the buffer is increased each time.
+            if index >= truncatedHistory.count {
+                index = 0
+                buffer += Double(maxTokenCount) * 0.10
+            }
         }
 
         if tokens.count > maxTokenCount {
-            print("WARNING: Truncation failed, tokens count is still greater than max token count")
-            print("Tokens: \(tokens.count)")
-            print("Max tokens: \(maxTokenCount)")
+            logger.error("WARNING: Truncation failed, tokens count is still greater than max token count. \(tokens.count) > \(self.maxTokenCount)")
         }
 
         return tokens
     }
 
-    // @InferenceActor
-    // private func finishResponse(from response: inout [String], to output: borrowing AsyncStream<String>.Continuation) async {
-    //     multibyteCharacter.removeAll()
-    //     var input = ""
-    //     if !history.isEmpty { // TODO: revisit this
-    //         // history.removeFirst(min(2, history.count))
-    //         input = preProcess(history)
-    //     } else {
-    //         response.scoup(response.count / 3)
-    //         input = preProcess(history)
-    //         input += response.joined()
-    //     }
-    //     let rest = getResponse(from: input)
-    //     for await restDelta in rest {
-    //         output.yield(restDelta)
-    //     }
-    // }
-
     /// - Returns: `true` if the token is to end a generation, `false` otherwise.
     private func process(_ token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
+        // Static variables to preserve state across multiple invocations of this function
         enum saved {
-            static var endIndex = 0
-            static var stopSequenceEndIndex = 0
-            static var letters: [CChar] = []
+            static var endIndex = 0 // Not used in the provided snippet
+            static var stopSequenceEndIndex = 0 // Tracks the current index in the stop sequence
+            static var letters: [CChar] = [] // Temporarily stores letters leading up to the stop sequence
         }
+
+        // Early return if the token matches the model's end token
         guard token != model.endToken else { return false }
+
+        // Decodes the token into a string (word)
         var word = decode(token)
+
+        // If there's a stop sequence defined, proceed with additional checks
         guard let stopSequence else { output.yield(word); return true }
 
-        var found = saved.stopSequenceEndIndex > 0
-        var letters: [CChar] = []
+        var found = saved.stopSequenceEndIndex > 0 // Indicates if we're currently matching the stop sequence
+        var letters: [CChar] = [] // Local variable to collect letters of the current word
         for letter in word.utf8CString {
-            guard letter != 0 else { break }
+            guard letter != 0 else { break } // Stops at the null terminator of the C string
+
+            // Checks if the current letter matches the next expected letter in the stop sequence
             if letter == stopSequence[saved.stopSequenceEndIndex] {
                 saved.stopSequenceEndIndex += 1
                 found = true
                 saved.letters.append(letter)
+
+                // If the entire stop sequence is matched, reset the tracker and do not output the word
                 guard saved.stopSequenceEndIndex == stopSequenceLength else { continue }
                 saved.stopSequenceEndIndex = 0
                 saved.letters.removeAll()
                 return false
             } else if found {
+                // If the sequence was being matched but the current letter doesn't fit, reset and output
                 saved.stopSequenceEndIndex = 0
                 if !saved.letters.isEmpty {
-                    word = String(cString: saved.letters + [0]) + word
+                    word = String(cString: saved.letters + [0]) + word // Prepend any matched letters to the word
                     saved.letters.removeAll()
                 }
-                output.yield(word)
+                output.yield(word) // Output the word to the stream
                 return true
             }
-            letters.append(letter)
+            letters.append(letter) // Add the letter to the local collection
         }
-        if !letters.isEmpty { output.yield(found ? String(cString: letters + [0]) : word) }
+
+        // Output the collected word (or the part of it that was being checked for the stop sequence)
+        if !letters.isEmpty {
+            output.yield(found ? String(cString: letters + [0]) : word)
+        }
         return true
     }
 
     private func getResponse(from history: borrowing[Chat]) -> AsyncStream<String> {
         .init { output in Task {
             guard prepare(history: history, to: output) else { return output.finish() }
-            // var response: [String] = []
             while currentCount < maxTokenCount {
                 let token = await predictNextToken()
                 if !process(token, to: output) { return output.finish() }
                 currentCount += 1
             }
-            // await finishResponse(from: &response, to: output)
             return output.finish()
         } }
     }
@@ -731,5 +731,19 @@ package extension String {
         let range = NSRange(location: 0, length: content.utf16.count)
         guard let match = pattern.firstMatch(in: content, range: range) else { return nil }
         return String(content[Range(match.range, in: content)!])
+    }
+}
+
+extension llama_context_params: CustomStringConvertible {
+    public var description: String {
+        """
+                llama_context_params(
+                seed: \(seed),
+                n_ctx: \(n_ctx),
+                n_batch: \(n_batch),
+                n_threads: \(n_threads),
+                n_threads_batch: \(n_threads_batch),
+                embedding: \(embedding),
+        """
     }
 }
