@@ -60,6 +60,12 @@ open class LLM: ObservableObject {
         #if targetEnvironment(simulator)
             modelParams.n_gpu_layers = 0
         #endif
+        // let overrides = llama_model_kv_override(
+        //     key: "repeat_penalty".cString(using: .utf8),
+        //     tag: LLAMA_KV_OVERRIDE_BOOL,
+        //     value: 1
+        // )
+        // modelParams.kv_overrides = overrides
         let model = llama_load_model_from_file(self.path, modelParams)!
         params = llama_context_default_params()
         let processorCount = UInt32(ProcessInfo().processorCount)
@@ -272,6 +278,9 @@ open class LLM: ObservableObject {
 
         // Early return if the token matches the model's end token
         guard token != model.endToken else { return false }
+
+        // Early return if we're not supposed to continue predicting
+        guard shouldContinuePredicting else { return false }
 
         // Decodes the token into a string (word)
         var word = decode(token)
