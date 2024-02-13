@@ -20,13 +20,7 @@ open class LLM: ObservableObject {
     public var template: Template! {
         didSet {
             preProcess = template.preProcess
-            if let stopSequence = template.stopSequence?.utf8CString {
-                self.stopSequence = stopSequence
-                stopSequenceLength = stopSequence.count - 1
-            } else {
-                stopSequence = nil
-                stopSequenceLength = 0
-            }
+            self.stopSequences = template.stopSequences
         }
     }
 
@@ -40,15 +34,15 @@ open class LLM: ObservableObject {
     private let maxTokenCount: Int
     private let totalTokenCount: Int
     private let newlineToken: Token
-    private var stopSequence: ContiguousArray<CChar>?
-    private var stopSequenceLength: Int
+    private var stopSequences: [String] = []
     private var params: llama_context_params
     private var isFull = false
     private var updateProgress: (Double) -> Void = { _ in }
+    private var shouldContinuePredicting = false
 
     public init(
         from path: String,
-        stopSequence: String? = nil,
+        stopSequences: [String] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
@@ -60,12 +54,6 @@ open class LLM: ObservableObject {
         #if targetEnvironment(simulator)
             modelParams.n_gpu_layers = 0
         #endif
-        // let overrides = llama_model_kv_override(
-        //     key: "repeat_penalty".cString(using: .utf8),
-        //     tag: LLAMA_KV_OVERRIDE_BOOL,
-        //     value: 1
-        // )
-        // modelParams.kv_overrides = overrides
         let model = llama_load_model_from_file(self.path, modelParams)!
         params = llama_context_default_params()
         let processorCount = UInt32(ProcessInfo().processorCount)
@@ -81,8 +69,7 @@ open class LLM: ObservableObject {
         self.model = model
         self.totalTokenCount = Int(llama_n_vocab(model))
         self.newlineToken = model.newLineToken
-        self.stopSequence = stopSequence?.utf8CString
-        stopSequenceLength = (self.stopSequence?.count ?? 1) - 1
+        self.stopSequences = stopSequences
         batch = llama_batch_init(Int32(self.maxTokenCount), 0, 1)
         logger.debug("PARAMS: \(self.params)")
     }
@@ -93,7 +80,7 @@ open class LLM: ObservableObject {
 
     public convenience init(
         from url: URL,
-        stopSequence: String? = nil,
+        stopSequences: [String] = [],
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
@@ -102,7 +89,7 @@ open class LLM: ObservableObject {
     ) {
         self.init(
             from: url.path,
-            stopSequence: stopSequence,
+            stopSequences: stopSequences,
             seed: seed,
             topK: topK,
             topP: topP,
@@ -148,7 +135,7 @@ open class LLM: ObservableObject {
     ) {
         self.init(
             from: url.path,
-            stopSequence: template.stopSequence,
+            stopSequences: template.stopSequences,
             seed: seed,
             topK: topK,
             topP: topP,
@@ -159,9 +146,14 @@ open class LLM: ObservableObject {
         self.template = template
     }
 
-    private var shouldContinuePredicting = false
+    /// Sets flag to stop predicting.
     public func stop() {
         shouldContinuePredicting = false
+    }
+
+    /// Resets the seed to a new random value.
+    public func setNewSeed() {
+        params.seed = UInt32.random(in: .min ... .max)
     }
 
     @InferenceActor
@@ -181,6 +173,7 @@ open class LLM: ObservableObject {
             llama_sample_top_k(context.pointer, &candidates, topK, 1)
             llama_sample_top_p(context.pointer, &candidates, topP, 1)
             llama_sample_temp(context.pointer, &candidates, temp)
+            // llama_sample_repetition_penalties(context.pointer, &candidates, last_tokens: UnsafePointer<llama_token>!, penalty_last_n: Int, penalty_repeat: Float, penalty_freq: Float, penalty_present: Float)
             token = llama_sample_token(context.pointer, &candidates)
         }
         batch.clear()
@@ -267,7 +260,7 @@ open class LLM: ObservableObject {
         return tokens
     }
 
-    /// - Returns: `true` if the token is to end a generation, `false` otherwise.
+    /// - Returns: `true` if the we should continue predicting based on the token, `false` otherwise, if it's the stop token or if we're not supposed to continue predicting.
     private func process(_ token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
         // Static variables to preserve state across multiple invocations of this function
         enum saved {
@@ -286,7 +279,17 @@ open class LLM: ObservableObject {
         var word = decode(token)
 
         // If there's a stop sequence defined, proceed with additional checks
-        guard let stopSequence else { output.yield(word); return true }
+        guard stopSequences.count != 0 else { output.yield(word); return true }
+
+        // for stopSequence in stopSequences {
+        //     if stopSequence == word {
+        //         logger.debug("Stop sequence found: \(word)")
+        //         return true
+        //     }
+        // }
+
+        let stopSequence = stopSequences[0].utf8CString
+        let stopSequenceLength = stopSequence.count - 1
 
         var found = saved.stopSequenceEndIndex > 0 // Indicates if we're currently matching the stop sequence
         var letters: [CChar] = [] // Local variable to collect letters of the current word
@@ -300,9 +303,14 @@ open class LLM: ObservableObject {
                 saved.letters.append(letter)
 
                 // If the entire stop sequence is matched, reset the tracker and do not output the word
-                guard saved.stopSequenceEndIndex == stopSequenceLength else { continue }
+                guard saved.stopSequenceEndIndex == stopSequenceLength else {
+                    logger.debug("CONTINUE: \(word)")
+                    continue
+                }
+
                 saved.stopSequenceEndIndex = 0
                 saved.letters.removeAll()
+                logger.debug("Stop sequence found: \(word)")
                 return false
             } else if found {
                 // If the sequence was being matched but the current letter doesn't fit, reset and output
@@ -312,15 +320,14 @@ open class LLM: ObservableObject {
                     saved.letters.removeAll()
                 }
                 output.yield(word) // Output the word to the stream
+                logger.debug("Output: \(word)")
                 return true
             }
             letters.append(letter) // Add the letter to the local collection
         }
 
-        // Output the collected word (or the part of it that was being checked for the stop sequence)
-        if !letters.isEmpty {
-            output.yield(found ? String(cString: letters + [0]) : word)
-        }
+        output.yield(found ? String(cString: letters + [0]) : word)
+        logger.debug("Output FINAL: \(word)")
         return true
     }
 
@@ -523,8 +530,7 @@ public struct Template {
     public let user: Attachment
     public let bot: Attachment
     public let systemPrompt: String?
-    public let stopSequence: String?
-    public let softStopSequences: [String]?
+    public let stopSequences: [String]
     public let prefix: String
     public let shouldDropLast: Bool
 
@@ -533,16 +539,14 @@ public struct Template {
         system: Attachment? = nil,
         user: Attachment? = nil,
         bot: Attachment? = nil,
-        stopSequence: String? = nil,
-        softStopSequences: [String]? = nil,
+        stopSequences: [String] = [],
         systemPrompt: String?,
         shouldDropLast: Bool = false
     ) {
         self.system = system ?? ("", "")
         self.user = user ?? ("", "")
         self.bot = bot ?? ("", "")
-        self.stopSequence = stopSequence
-        self.softStopSequences = softStopSequences
+        self.stopSequences = stopSequences
         self.systemPrompt = systemPrompt
         self.prefix = prefix
         self.shouldDropLast = shouldDropLast
@@ -575,7 +579,7 @@ public struct Template {
             system: ("<|im_start|>system\n", "<|im_end|>\n"),
             user: ("<|im_start|>user\n", "<|im_end|>\n"),
             bot: ("<|im_start|>assistant\n", "<|im_end|>\n"),
-            stopSequence: "<|im_end|>",
+            stopSequences: ["<|im_end|>", "<|im_start|>"],
             systemPrompt: systemPrompt
         )
     }
@@ -585,7 +589,7 @@ public struct Template {
             system: ("", "\n\n"),
             user: ("### Instruction:\n", "\n\n"),
             bot: ("### Response:\n", "\n\n"),
-            stopSequence: "###",
+            stopSequences: ["###"],
             systemPrompt: systemPrompt
         )
     }
@@ -596,7 +600,7 @@ public struct Template {
             system: ("<<SYS>>\n", "\n<</SYS>>\n\n"),
             user: ("", " [/INST]"),
             bot: (" ", "</s><s>[INST] "),
-            stopSequence: "</s>",
+            stopSequences: ["</s>"],
             systemPrompt: systemPrompt,
             shouldDropLast: true
         )
@@ -605,8 +609,7 @@ public struct Template {
     public static let mistral = Template(
         user: ("[INST] ", " [/INST]"),
         bot: ("", "</s> "),
-        stopSequence: "</s>",
-        softStopSequences: ["[INST]", "[/INST]"],
+        stopSequences: ["</s>", "[INST]", "[/INST]"],
         systemPrompt: nil
     )
 }
@@ -619,8 +622,7 @@ extension Template: CustomStringConvertible {
             system: ("\(system.prefix)", "\(system.suffix)"),
             user: ("\(user.prefix)", "\(user.suffix)"),
             bot: ("\(bot.prefix)", "\(bot.suffix)"),
-            stopSequence: "\(stopSequence ?? "")",
-            softStopSequences: \(softStopSequences?.description ?? "nil"),
+            stopSequences: "\(stopSequences)",
             systemPrompt: "\(systemPrompt ?? "")",
             shouldDropLast: \(shouldDropLast)
         )
