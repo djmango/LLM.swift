@@ -27,7 +27,10 @@ open class LLM: ObservableObject {
     public var topK: Int32
     public var topP: Float
     public var temp: Float
-    public var repeatPenalty: Float
+    public var repeat_last_n: Int
+    public var repeat_penalty: Float
+    public var presence_penalty: Float
+    public var frequency_penalty: Float
     public var path: URL
 
     private var context: Context?
@@ -49,7 +52,10 @@ open class LLM: ObservableObject {
         topK: Int32 = 40,
         topP: Float = 0.95,
         temp: Float = 0.8,
-        repeatPenalty: Float = 1.1,
+        repeat_penalty: Float = 1.1,
+        repeat_last_n: Int = 64,
+        presence_penalty: Float = 0.0,
+        frequency_penalty: Float = 0.0,
         maxTokenCount: Int32 = 2048
     ) {
         self.path = path
@@ -71,7 +77,10 @@ open class LLM: ObservableObject {
         self.topK = topK
         self.topP = topP
         self.temp = temp
-        self.repeatPenalty = repeatPenalty
+        self.repeat_penalty = repeat_penalty
+        self.repeat_last_n = repeat_last_n
+        self.presence_penalty = presence_penalty
+        self.frequency_penalty = frequency_penalty
         self.model = model
         self.totalTokenCount = Int(llama_n_vocab(model))
         self.newlineToken = model.newLineToken
@@ -139,7 +148,8 @@ open class LLM: ObservableObject {
             llama_sample_top_k(context.pointer, &candidates, topK, 1)
             llama_sample_top_p(context.pointer, &candidates, topP, 1)
             llama_sample_temp(context.pointer, &candidates, temp)
-            // llama_sample_repetition_penalties(context.pointer, &candidates, last_tokens: UnsafePointer<llama_token>!, penalty_last_n: Int, penalty_repeat: Float, penalty_freq: Float, penalty_present: Float)
+            // llama_sample_repetition_penalties(ctx: OpaquePointer!, candidates: UnsafeMutablePointer<llama_token_data_array>!, last_tokens: UnsafePointer<llama_token>!, penalty_last_n: Int, penalty_repeat: Float, penalty_freq: Float, penalty_present: Float)
+            llama_sample_repetition_penalties(context.pointer, &candidates, batch.token, repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty)
             token = llama_sample_token(context.pointer, &candidates)
         }
         batch.clear()
@@ -148,24 +158,27 @@ open class LLM: ObservableObject {
         return token
     }
 
-    open func recoverFromLengthy(_: borrowing String, to output: borrowing AsyncStream<String>.Continuation) {
-        output.yield("tl;dr")
-    }
-
     /// - Returns: `true` if ready to predict the next token, `false` otherwise.
     private func prepare(history: [Chat]) -> Bool {
+        var start = DispatchTime.now()
         guard !history.isEmpty else { return false }
         context = .init(model, params)
         guard let context else { fatalError("Context is nil") }
 
         let tokens = truncateAndEncode(history: history)
+        logger.debug("Truncated and encoded in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
+        start = DispatchTime.now()
+
         let initialCount = tokens.count
         currentCount = Int32(initialCount)
         for (i, token) in tokens.enumerated() {
             batch.n_tokens = Int32(i)
             batch.add(token, batch.n_tokens, [0], i == initialCount - 1)
         }
+        logger.debug("Added tokens to batch in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
+        start = DispatchTime.now()
         context.decode(batch)
+        logger.debug("Decoded batch in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
         shouldContinuePredicting = true
         return true
     }
@@ -311,7 +324,7 @@ open class LLM: ObservableObject {
             while currentCount < maxTokenCount {
                 start = DispatchTime.now()
                 let token = await predictNextToken()
-                logger.debug("Predicted token in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
+                // logger.debug("Predicted token in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
                 if !process(token, to: output) { return output.finish() }
                 currentCount += 1
 
