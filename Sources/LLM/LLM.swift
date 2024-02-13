@@ -17,17 +17,18 @@ open class LLM: ObservableObject {
     public var preProcess: (_ history: [Chat]) -> String = { $0.map(\.content).joined() }
     public var postProcess: (_ output: String) -> Void = { _ in }
     public var update: (_ outputDelta: String?) -> Void = { _ in }
-    public var template: Template! {
+    public var template: Template {
         didSet {
             preProcess = template.preProcess
-            self.stopSequences = template.stopSequences
+            stopSequences = template.stopSequences
         }
     }
 
     public var topK: Int32
     public var topP: Float
     public var temp: Float
-    public var path: [CChar]
+    public var repeatPenalty: Float
+    public var path: URL
 
     private var context: Context?
     private var batch: llama_batch
@@ -39,22 +40,26 @@ open class LLM: ObservableObject {
     private var isFull = false
     private var updateProgress: (Double) -> Void = { _ in }
     private var shouldContinuePredicting = false
+    private var currentCount: Int32 = 0
 
     public init(
-        from path: String,
-        stopSequences: [String] = [],
+        from path: URL,
+        template: Template,
         seed: UInt32 = .random(in: .min ... .max),
         topK: Int32 = 40,
         topP: Float = 0.95,
         temp: Float = 0.8,
+        repeatPenalty: Float = 1.1,
         maxTokenCount: Int32 = 2048
     ) {
-        self.path = path.cString(using: .utf8)!
+        self.path = path
         var modelParams = llama_model_default_params()
         #if targetEnvironment(simulator)
             modelParams.n_gpu_layers = 0
         #endif
-        let model = llama_load_model_from_file(self.path, modelParams)!
+        let cPath = path.path.cString(using: .utf8)
+        guard let model = llama_load_model_from_file(cPath, modelParams)
+        else { fatalError("Failed to load model from file") }
         params = llama_context_default_params()
         let processorCount = UInt32(ProcessInfo().processorCount)
         self.maxTokenCount = Int(min(maxTokenCount, llama_n_ctx_train(model)))
@@ -66,36 +71,19 @@ open class LLM: ObservableObject {
         self.topK = topK
         self.topP = topP
         self.temp = temp
+        self.repeatPenalty = repeatPenalty
         self.model = model
         self.totalTokenCount = Int(llama_n_vocab(model))
         self.newlineToken = model.newLineToken
-        self.stopSequences = stopSequences
+        self.template = template
+        self.stopSequences = template.stopSequences
+        self.preProcess = template.preProcess
         batch = llama_batch_init(Int32(self.maxTokenCount), 0, 1)
         logger.debug("PARAMS: \(self.params)")
     }
 
     deinit {
         llama_free_model(model)
-    }
-
-    public convenience init(
-        from url: URL,
-        stopSequences: [String] = [],
-        seed: UInt32 = .random(in: .min ... .max),
-        topK: Int32 = 40,
-        topP: Float = 0.95,
-        temp: Float = 0.8,
-        maxTokenCount: Int32 = 2048
-    ) {
-        self.init(
-            from: url.path,
-            stopSequences: stopSequences,
-            seed: seed,
-            topK: topK,
-            topP: topP,
-            temp: temp,
-            maxTokenCount: maxTokenCount
-        )
     }
 
     public convenience init(
@@ -122,28 +110,6 @@ open class LLM: ObservableObject {
             maxTokenCount: maxTokenCount
         )
         self.updateProgress = updateProgress
-    }
-
-    public convenience init(
-        from url: URL,
-        template: Template,
-        seed: UInt32 = .random(in: .min ... .max),
-        topK: Int32 = 40,
-        topP: Float = 0.95,
-        temp: Float = 0.8,
-        maxTokenCount: Int32 = 2048
-    ) {
-        self.init(
-            from: url.path,
-            stopSequences: template.stopSequences,
-            seed: seed,
-            topK: topK,
-            topP: topP,
-            temp: temp,
-            maxTokenCount: maxTokenCount
-        )
-        self.preProcess = template.preProcess
-        self.template = template
     }
 
     /// Sets flag to stop predicting.
@@ -181,8 +147,6 @@ open class LLM: ObservableObject {
         context.decode(batch)
         return token
     }
-
-    private var currentCount: Int32!
 
     open func recoverFromLengthy(_: borrowing String, to output: borrowing AsyncStream<String>.Continuation) {
         output.yield("tl;dr")
@@ -264,8 +228,7 @@ open class LLM: ObservableObject {
     private func process(_ token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
         // Static variables to preserve state across multiple invocations of this function
         enum saved {
-            static var endIndex = 0 // Not used in the provided snippet
-            static var stopSequenceEndIndex = 0 // Tracks the current index in the stop sequence
+            static var stopSequenceEndIndices: [Int] = [] // Tracks the current index in the stop sequence
             static var letters: [CChar] = [] // Temporarily stores letters leading up to the stop sequence
         }
 
@@ -281,67 +244,78 @@ open class LLM: ObservableObject {
         // If there's a stop sequence defined, proceed with additional checks
         guard stopSequences.count != 0 else { output.yield(word); return true }
 
-        // for stopSequence in stopSequences {
-        //     if stopSequence == word {
-        //         logger.debug("Stop sequence found: \(word)")
-        //         return true
-        //     }
-        // }
+        // Convert stop sequences to CStrings and store their lengths
+        let stopSequences = stopSequences.map(\.utf8CString)
+        let stopSequenceLengths = stopSequences.map { $0.count - 1 }
+        // Initialize stop sequence end indices if not already initialized, just a bunch of 0s
+        saved.stopSequenceEndIndices = Array(repeating: 0, count: stopSequences.count)
 
-        let stopSequence = stopSequences[0].utf8CString
-        let stopSequenceLength = stopSequence.count - 1
+        // Iterate through the word and check if it matches any of the stop sequences
+        var found = false
+        var letters: [CChar] = []
 
-        var found = saved.stopSequenceEndIndex > 0 // Indicates if we're currently matching the stop sequence
-        var letters: [CChar] = [] // Local variable to collect letters of the current word
         for letter in word.utf8CString {
-            guard letter != 0 else { break } // Stops at the null terminator of the C string
+            guard letter != 0 else { break }
 
-            // Checks if the current letter matches the next expected letter in the stop sequence
-            if letter == stopSequence[saved.stopSequenceEndIndex] {
-                saved.stopSequenceEndIndex += 1
-                found = true
-                saved.letters.append(letter)
+            for (index, stopSequence) in stopSequences.enumerated() {
+                // If the current letter matches the stop sequence at the current index, increment the index
+                if letter == stopSequence[saved.stopSequenceEndIndices[index]] {
+                    saved.stopSequenceEndIndices[index] += 1
+                    found = true
+                    saved.letters.append(letter)
 
-                // If the entire stop sequence is matched, reset the tracker and do not output the word
-                guard saved.stopSequenceEndIndex == stopSequenceLength else {
-                    logger.debug("CONTINUE: \(word)")
-                    continue
+                    if saved.stopSequenceEndIndices[index] == stopSequenceLengths[index] {
+                        // Stop sequence matched, perform reset and return
+                        saved.stopSequenceEndIndices[index] = 0
+                        saved.letters.removeAll()
+                        logger.debug("Stop sequence found: \(word)")
+                        return false
+                    }
+                } else {
+                    saved.stopSequenceEndIndices[index] = 0
                 }
-
-                saved.stopSequenceEndIndex = 0
-                saved.letters.removeAll()
-                logger.debug("Stop sequence found: \(word)")
-                return false
-            } else if found {
-                // If the sequence was being matched but the current letter doesn't fit, reset and output
-                saved.stopSequenceEndIndex = 0
-                if !saved.letters.isEmpty {
-                    word = String(cString: saved.letters + [0]) + word // Prepend any matched letters to the word
-                    saved.letters.removeAll()
-                }
-                output.yield(word) // Output the word to the stream
-                logger.debug("Output: \(word)")
-                return true
             }
-            letters.append(letter) // Add the letter to the local collection
+
+            // If the letter didn't match any stop sequence, append it to the letters array
+            if !found {
+                letters.append(letter)
+            }
         }
 
-        output.yield(found ? String(cString: letters + [0]) : word)
-        logger.debug("Output FINAL: \(word)")
+        if found {
+            // Handle case where letters matched part of a stop sequence
+            // If the sequence was being matched but the current letter doesn't fit, reset and output
+            saved.stopSequenceEndIndices = Array(repeating: 0, count: stopSequences.count)
+            if !saved.letters.isEmpty {
+                word = String(cString: saved.letters + [0]) + word // Prepend any matched letters to the word
+                saved.letters.removeAll()
+            }
+            logger.debug("Stop sequence found: \(word)")
+            output.yield(word) // Output the word to the stream
+        } else {
+            // No stop sequence found, output the entire word
+            output.yield(word)
+        }
+
         return true
     }
 
     private func getResponse(from history: borrowing[Chat]) -> AsyncStream<String> {
         .init { output in Task {
+            var start = DispatchTime.now()
             guard prepare(history: history) else { return output.finish() }
+            logger.debug("Prepared in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
 
             var outputString = ""
 
             while currentCount < maxTokenCount {
+                start = DispatchTime.now()
                 let token = await predictNextToken()
+                logger.debug("Predicted token in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
                 if !process(token, to: output) { return output.finish() }
                 currentCount += 1
 
+                start = DispatchTime.now()
                 outputString += decode(token)
 
                 // Now we check if we have to slide the history window
