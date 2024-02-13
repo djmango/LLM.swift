@@ -24,13 +24,27 @@ open class LLM: ObservableObject {
         }
     }
 
+    /// Reduces the probability of generating nonsense. A higher value (e.g. 100) will give more diverse answers, while a lower value (e.g. 10) will be more conservative. (Default: 40)
     public var topK: Int32
+    /// Works together with top-k. A higher value (e.g., 0.95) will lead to more diverse text, while a lower value (e.g., 0.5) will generate more focused and conservative text. (Default: 0.9)
     public var topP: Float
+    /// The temperature of the model. Increasing the temperature will make the model answer more creatively. (Default: 0.8)
     public var temp: Float
+    /// Sets how far back for the model to look back to prevent repetition. (Default: 64, 0 = disabled, -1 = num_ctx)
     public var repeat_last_n: Int
+    /// Sets how strongly to penalize repetitions. A higher value (e.g., 1.5) will penalize repetitions more strongly, while a lower value (e.g., 0.9) will be more lenient. (Default: 1.1)
     public var repeat_penalty: Float
+    /// Sets how strongly to penalize presence of tokens in the output. A higher value (e.g., 0.5) will penalize presence more strongly, while a lower value (e.g., 0.1) will be more lenient. (Default: 0.0)
     public var presence_penalty: Float
+    /// Sets how strongly to penalize frequency of tokens in the output. A higher value (e.g., 0.5) will penalize frequency more strongly, while a lower value (e.g., 0.1) will be more lenient. (Default: 0.0)
     public var frequency_penalty: Float
+    // /// Enable Mirostat sampling for controlling perplexity. (default: 0, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)
+    // public var mirostat: Int
+    // /// Influences how quickly the algorithm responds to feedback from the generated text. A lower learning rate will result in slower adjustments, while a higher learning rate will make the algorithm more responsive. (Default: 0.1)
+    // public var mirostat_tau: Float
+    // /// Controls the balance between coherence and diversity of the output. A lower value will result in more focused and coherent text. (Default: 5.0)
+    // public var mirostat_eta: Float
+
     public var path: URL
 
     private var context: Context?
@@ -56,6 +70,9 @@ open class LLM: ObservableObject {
         repeat_last_n: Int = 64,
         presence_penalty: Float = 0.0,
         frequency_penalty: Float = 0.0,
+        // mirostat: Int = 0,
+        // mirostat_tau: Float = 5.0,
+        // mirostat_eta: Float = 0.1,
         maxTokenCount: Int32 = 2048
     ) {
         self.path = path
@@ -81,6 +98,9 @@ open class LLM: ObservableObject {
         self.repeat_last_n = repeat_last_n
         self.presence_penalty = presence_penalty
         self.frequency_penalty = frequency_penalty
+        // self.mirostat = mirostat
+        // self.mirostat_tau = mirostat_tau
+        // self.mirostat_eta = mirostat_eta
         self.model = model
         self.totalTokenCount = Int(llama_n_vocab(model))
         self.newlineToken = model.newLineToken
@@ -150,6 +170,12 @@ open class LLM: ObservableObject {
             llama_sample_temp(context.pointer, &candidates, temp)
             // llama_sample_repetition_penalties(ctx: OpaquePointer!, candidates: UnsafeMutablePointer<llama_token_data_array>!, last_tokens: UnsafePointer<llama_token>!, penalty_last_n: Int, penalty_repeat: Float, penalty_freq: Float, penalty_present: Float)
             llama_sample_repetition_penalties(context.pointer, &candidates, batch.token, repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty)
+            // llama_sample_token_mirostat_v2(ctx: OpaquePointer!, candidates: UnsafeMutablePointer<llama_token_data_array>!, tau: Float, eta: Float, mu: UnsafeMutablePointer<Float>!)
+            // if mirostat == 1 {
+            //     llama_sample_token_mirostat(context.pointer, &candidates, mirostat_tau, mirostat_eta, nil)
+            // } else if mirostat == 2 {
+            //     llama_sample_token_mirostat_v2(context.pointer, &candidates, mirostat_tau, mirostat_eta, nil)
+            // }
             token = llama_sample_token(context.pointer, &candidates)
         }
         batch.clear()
@@ -238,76 +264,51 @@ open class LLM: ObservableObject {
     }
 
     /// - Returns: `true` if the we should continue predicting based on the token, `false` otherwise, if it's the stop token or if we're not supposed to continue predicting.
-    private func process(_ token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
-        // Static variables to preserve state across multiple invocations of this function
-        enum saved {
-            static var stopSequenceEndIndices: [Int] = [] // Tracks the current index in the stop sequence
-            static var letters: [CChar] = [] // Temporarily stores letters leading up to the stop sequence
-        }
-
+    private func process(_ encoded_token: Token, to output: borrowing AsyncStream<String>.Continuation) -> Bool {
         // Early return if the token matches the model's end token
-        guard token != model.endToken else { return false }
+        guard encoded_token != model.endToken else { return false }
 
         // Early return if we're not supposed to continue predicting
         guard shouldContinuePredicting else { return false }
 
-        // Decodes the token into a string (word)
-        var word = decode(token)
+        // Decode the token into a string
+        let token = decode(encoded_token)
 
-        // If there's a stop sequence defined, proceed with additional checks
-        guard stopSequences.count != 0 else { output.yield(word); return true }
+        // Save the last few characters to check for stop sequences
+        enum saved {
+            /// Accumulated output for each stop sequence
+            static var accumulatedOutput: [String: String] = [:]
+        }
 
-        // Convert stop sequences to CStrings and store their lengths
-        let stopSequences = stopSequences.map(\.utf8CString)
-        let stopSequenceLengths = stopSequences.map { $0.count - 1 }
-        // Initialize stop sequence end indices if not already initialized, just a bunch of 0s
-        saved.stopSequenceEndIndices = Array(repeating: 0, count: stopSequences.count)
+        // If there's no stop sequence defined, don't proceed with additional checks
+        guard stopSequences.count != 0 else { output.yield(token); return true }
 
-        // Iterate through the word and check if it matches any of the stop sequences
-        var found = false
-        var letters: [CChar] = []
-
-        for letter in word.utf8CString {
-            guard letter != 0 else { break }
-
-            for (index, stopSequence) in stopSequences.enumerated() {
-                // If the current letter matches the stop sequence at the current index, increment the index
-                if letter == stopSequence[saved.stopSequenceEndIndices[index]] {
-                    saved.stopSequenceEndIndices[index] += 1
-                    found = true
-                    saved.letters.append(letter)
-
-                    if saved.stopSequenceEndIndices[index] == stopSequenceLengths[index] {
-                        // Stop sequence matched, perform reset and return
-                        saved.stopSequenceEndIndices[index] = 0
-                        saved.letters.removeAll()
-                        logger.debug("Stop sequence found: \(word)")
-                        return false
-                    }
-                } else {
-                    saved.stopSequenceEndIndices[index] = 0
-                }
-            }
-
-            // If the letter didn't match any stop sequence, append it to the letters array
-            if !found {
-                letters.append(letter)
+        for stopSequence in stopSequences {
+            let concatenated = saved.accumulatedOutput[stopSequence, default: ""] + token
+            if concatenated == stopSequence {
+                // If the token matches the stop sequence, return false and end the prediction
+                logger.debug("Found stop sequence: \(stopSequence)")
+                return false
+            } else if stopSequence.hasPrefix(concatenated) {
+                // If the token matches at least partially the stop sequence, save the last few characters
+                saved.accumulatedOutput[stopSequence] = concatenated
+                logger.debug("Saved last few characters for stop sequence: \(stopSequence): \(concatenated)")
+            } else {
+                // If the token doesn't match at least partially the stop sequence, reset the last few characters
+                saved.accumulatedOutput[stopSequence] = ""
+                logger.debug("Reset last few characters for stop sequence: \(stopSequence)")
             }
         }
 
-        if found {
-            // Handle case where letters matched part of a stop sequence
-            // If the sequence was being matched but the current letter doesn't fit, reset and output
-            saved.stopSequenceEndIndices = Array(repeating: 0, count: stopSequences.count)
-            if !saved.letters.isEmpty {
-                word = String(cString: saved.letters + [0]) + word // Prepend any matched letters to the word
-                saved.letters.removeAll()
-            }
-            logger.debug("Stop sequence found: \(word)")
-            output.yield(word) // Output the word to the stream
-        } else {
-            // No stop sequence found, output the entire word
-            output.yield(word)
+        // NOTE: there is a potential bug here but not a problem for most LLMs because their stop tokens are actually logical tokens or made up wholey thereof
+        // The bug is that if a token is some random char + the start of a stop token, it will be ignored and discarded and the stop token will be missed
+        // I'm willing to accept this risk for my fork for now, but it's something to keep in mind for the future
+
+        // If we are accumulating the output, wait to yield the token
+        if saved.accumulatedOutput.allSatisfy({ $1.isEmpty }) {
+            // Only executes if all accumulated outputs are empty
+            output.yield(token)
+            return true
         }
 
         return true
