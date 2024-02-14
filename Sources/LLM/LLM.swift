@@ -283,32 +283,40 @@ open class LLM: ObservableObject {
         // If there's no stop sequence defined, don't proceed with additional checks
         guard stopSequences.count != 0 else { output.yield(token); return true }
 
-        for stopSequence in stopSequences {
-            let concatenated = saved.accumulatedOutput[stopSequence, default: ""] + token
-            if concatenated == stopSequence {
-                // If the token matches the stop sequence, return false and end the prediction
-                logger.debug("Found stop sequence: \(stopSequence)")
-                return false
-            } else if stopSequence.hasPrefix(concatenated) {
-                // If the token matches at least partially the stop sequence, save the last few characters
-                saved.accumulatedOutput[stopSequence] = concatenated
-                logger.debug("Saved last few characters for stop sequence: \(stopSequence): \(concatenated)")
-            } else {
-                // If the token doesn't match at least partially the stop sequence, reset the last few characters
-                saved.accumulatedOutput[stopSequence] = ""
-                logger.debug("Reset last few characters for stop sequence: \(stopSequence)")
+        // Enumerate through each character in the token and yield if not in a potential stop sequence, otherwise save the last few characters. Yield when found to not be a stop sequence to avoid losing chars.
+        for character in token {
+            var released = false
+
+            for stopSequence in stopSequences {
+                let concatenated = saved.accumulatedOutput[stopSequence, default: ""] + String(character)
+                if concatenated == stopSequence {
+                    // If the token matches the stop sequence, return false and end the prediction
+                    logger.debug("Found stop sequence: \(stopSequence)")
+
+                    // Clear the accumulated output
+                    for (key, _) in saved.accumulatedOutput {
+                        saved.accumulatedOutput[key] = ""
+                    }
+
+                    return false
+                } else if stopSequence.hasPrefix(concatenated) {
+                    // If the token matches at least partially the stop sequence, save the last few characters
+                    saved.accumulatedOutput[stopSequence] = concatenated
+                    logger.debug("Saved last few characters for stop sequence: \(stopSequence): \(concatenated)")
+                } else {
+                    // If the token doesn't match at least partially the stop sequence, reset the last few characters and yield the token if it hasn't been already
+                    saved.accumulatedOutput[stopSequence] = ""
+
+                    if saved.accumulatedOutput.allSatisfy({ $1.isEmpty }) {
+                        // Only executes if all accumulated outputs are empty
+                        if !released {
+                            released = true
+                            output.yield(concatenated)
+                            // logger.debug("Yielded token: \(concatenated)")
+                        }
+                    }
+                }
             }
-        }
-
-        // NOTE: there is a potential bug here but not a problem for most LLMs because their stop tokens are actually logical tokens or made up wholey thereof
-        // The bug is that if a token is some random char + the start of a stop token, it will be ignored and discarded and the stop token will be missed
-        // I'm willing to accept this risk for my fork for now, but it's something to keep in mind for the future
-
-        // If we are accumulating the output, wait to yield the token
-        if saved.accumulatedOutput.allSatisfy({ $1.isEmpty }) {
-            // Only executes if all accumulated outputs are empty
-            output.yield(token)
-            return true
         }
 
         return true
