@@ -4,7 +4,7 @@ import OSLog
 
 public typealias Token = llama_token
 public typealias Model = OpaquePointer
-public typealias Chat = (role: Role, content: String)
+public typealias Chat = (role: ChatRole, content: String)
 
 @globalActor public actor InferenceActor {
     public static let shared = InferenceActor()
@@ -16,7 +16,6 @@ open class LLM: ObservableObject {
     public var model: Model
     public var preProcess: (_ history: [Chat]) -> String = { $0.map(\.content).joined() }
     public var postProcess: (_ output: String) -> Void = { _ in }
-    public var update: (_ outputDelta: String?) -> Void = { _ in }
     public var template: Template {
         didSet {
             preProcess = template.preProcess
@@ -168,14 +167,7 @@ open class LLM: ObservableObject {
             llama_sample_top_k(context.pointer, &candidates, topK, 1)
             llama_sample_top_p(context.pointer, &candidates, topP, 1)
             llama_sample_temp(context.pointer, &candidates, temp)
-            // llama_sample_repetition_penalties(ctx: OpaquePointer!, candidates: UnsafeMutablePointer<llama_token_data_array>!, last_tokens: UnsafePointer<llama_token>!, penalty_last_n: Int, penalty_repeat: Float, penalty_freq: Float, penalty_present: Float)
             llama_sample_repetition_penalties(context.pointer, &candidates, batch.token, repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty)
-            // llama_sample_token_mirostat_v2(ctx: OpaquePointer!, candidates: UnsafeMutablePointer<llama_token_data_array>!, tau: Float, eta: Float, mu: UnsafeMutablePointer<Float>!)
-            // if mirostat == 1 {
-            //     llama_sample_token_mirostat(context.pointer, &candidates, mirostat_tau, mirostat_eta, nil)
-            // } else if mirostat == 2 {
-            //     llama_sample_token_mirostat_v2(context.pointer, &candidates, mirostat_tau, mirostat_eta, nil)
-            // }
             token = llama_sample_token(context.pointer, &candidates)
         }
         batch.clear()
@@ -207,6 +199,56 @@ open class LLM: ObservableObject {
         logger.debug("Decoded batch in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
         shouldContinuePredicting = true
         return true
+    }
+
+    /// - Parameters:
+    ///   - string: The input string to be tokenized.
+    /// - Returns: The number of tokens in the string.
+    public func numTokens(_ string: String, doPreProcess: Bool = false) -> Int {
+        if doPreProcess {
+            return encode(preProcess([(.user, string)])).count
+        }
+        return encode(string).count
+    }
+
+    /// Splits the input string into chunks based on tokenization, aiming for each chunk to be close to `maxTokenCount`.
+    /// - Parameters:
+    ///   - input: The input string to be chunked.
+    ///   - maxTokenCount: The maximum number of tokens allowed per chunk.
+    /// - Returns: An array of string chunks, each chunk being close to the `maxTokenCount` limit.
+    public func chunkInputByTokenCount(input: String, maxTokenCount: Int) -> [String] {
+        var chunks: [String] = []
+        var currentChunkStart = input.startIndex
+
+        while currentChunkStart < input.endIndex {
+            var currentChunkEnd = input.endIndex
+            var chunkSize = input.distance(from: currentChunkStart, to: currentChunkEnd)
+
+            let chatMessage = Chat(role: .user, content: String(input[currentChunkStart ..< currentChunkEnd]))
+            var encoded = encode(preProcess([chatMessage]))
+
+            // Reduce the chunk until it fits the maxTokenCount or cannot be reduced further
+            while encoded.count > maxTokenCount, chunkSize > 0 {
+                chunkSize = max((encoded.count - maxTokenCount) * 4, chunkSize / 2) // Adjust chunk size based on token count
+                let possibleEndIndex = input.index(currentChunkStart, offsetBy: chunkSize, limitedBy: input.endIndex) ?? input.endIndex
+                currentChunkEnd = possibleEndIndex
+                let chatMessage = Chat(role: .user, content: String(input[currentChunkStart ..< currentChunkEnd]))
+                encoded = encode(preProcess([chatMessage]))
+            }
+
+            // Add the valid chunk to the chunks array
+            let validChunk = String(input[currentChunkStart ..< currentChunkEnd])
+            chunks.append(validChunk)
+
+            // Update the start for the next chunk
+            currentChunkStart = currentChunkEnd
+        }
+
+        // Token counts print
+        let tokenCounts = chunks.map { encode(preProcess([(.user, $0)])).count }
+        logger.debug("Token counts: \(tokenCounts)")
+
+        return chunks
     }
 
     /// Returns list of tokens, encoded from the history, truncated to the maximum token count.
@@ -302,7 +344,7 @@ open class LLM: ObservableObject {
                 } else if stopSequence.hasPrefix(concatenated) {
                     // If the token matches at least partially the stop sequence, save the last few characters
                     saved.accumulatedOutput[stopSequence] = concatenated
-                    logger.debug("Saved last few characters for stop sequence: \(stopSequence): \(concatenated)")
+                    // logger.debug("Saved last few characters for stop sequence: \(stopSequence): \(concatenated)")
                 } else {
                     // If the token doesn't match at least partially the stop sequence, reset the last few characters and yield the token if it hasn't been already
                     saved.accumulatedOutput[stopSequence] = ""
@@ -322,7 +364,7 @@ open class LLM: ObservableObject {
         return true
     }
 
-    private func getResponse(from history: borrowing[Chat]) -> AsyncStream<String> {
+    private func getResponse(from history: borrowing[Chat], shouldSlide: Bool = true) -> AsyncStream<String> {
         .init { output in Task {
             var start = DispatchTime.now()
             guard prepare(history: history) else { return output.finish() }
@@ -334,17 +376,20 @@ open class LLM: ObservableObject {
                 start = DispatchTime.now()
                 let token = await predictNextToken()
                 // logger.debug("Predicted token in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
-                if !process(token, to: output) { return output.finish() }
+                if !process(token, to: output) {
+                    logger.debug("Finished in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
+                    return output.finish()
+                }
                 currentCount += 1
 
                 start = DispatchTime.now()
                 outputString += decode(token)
 
                 // Now we check if we have to slide the history window
-                if currentCount >= maxTokenCount {
+                if currentCount >= maxTokenCount, shouldSlide {
                     let start = DispatchTime.now()
                     // Add the current output to the history
-                    let chat = (role: Role.bot, content: outputString)
+                    let chat = (role: ChatRole.bot, content: outputString)
                     let newHistory = history + [chat]
                     logger.debug("New history: \(newHistory)")
                     guard prepare(history: newHistory) else { return output.finish() }
@@ -352,6 +397,7 @@ open class LLM: ObservableObject {
                     logger.debug("New current count: \(self.currentCount)")
                 }
             }
+            logger.debug("Finished in \(String(format: "%.2f", Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000)) seconds")
             return output.finish()
         } }
     }
@@ -391,21 +437,29 @@ open class LLM: ObservableObject {
         isAvailable = true
     }
 
-    open func respond(to history: [Chat]) async -> String {
-        var output = ""
-
-        // Using a custom asynchronous closure-based method
-        await respond(to: history) { [self] response in
-            for await responseDelta in response {
-                update(responseDelta)
-                output += responseDelta
+    /// An asynchronous function that takes chats as input and returns a response.
+    @InferenceActor
+    public func arespond(to history: [Chat]) async -> String {
+        var result = ""
+        let processOutputWrapped = { (stream: AsyncStream<String>) async -> String in
+            for await line in stream {
+                result += line
+                // print("RESULT: \(result)")
             }
-            update(nil)
-            return output
+            // print("RETURNING: \(result)")
+            return result
         }
 
-        let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedOutput.isEmpty ? "..." : trimmedOutput
+        let response = getResponse(from: history, shouldSlide: false)
+        let output = await processOutputWrapped(response)
+
+        // print("Result: \(result)")
+        // print("Result length: \(result.count)")
+        // print("Output: \(output)")
+        // print("Output length: \(output.count)")
+        // print("ACHAT")
+
+        return output
     }
 
     private var multibyteCharacter: [CUnsignedChar] = []
@@ -511,7 +565,7 @@ extension Token {
     }
 }
 
-public enum Role {
+public enum ChatRole {
     case user
     case bot
 }
